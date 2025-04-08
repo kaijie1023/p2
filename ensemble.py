@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler
-from torchvision import transforms
+from torchvision import datasets, transforms
 from torchvision.models import resnet18, densenet121, ResNet18_Weights, DenseNet121_Weights
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
@@ -266,14 +266,16 @@ def stratified_cross_validation(
         # Split train into train and validation
         train_idx, val_idx = train_test_split(train_index, test_size=0.125, stratify=targets)
 
-        # Create data samplers and loaders
-        train_sampler = SubsetRandomSampler(train_idx)
-        val_sampler = SubsetRandomSampler(val_idx)
-        test_sampler = SubsetRandomSampler(test_index)
+        # Create train and validation datasets with appropriate transforms
+        train_dataset = datasets.ImageFolder(
+            root=dataset_path,
+            transform=train_transforms
+        )
         
-        train_loader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler)
-        val_loader = DataLoader(dataset, batch_size=batch_size, sampler=val_sampler)
-        test_loader = DataLoader(dataset, batch_size=batch_size, sampler=test_sampler)
+        val_dataset = datasets.ImageFolder(
+            root=dataset_path, 
+            transform=val_transforms
+        )
         
         # Initialize model
         num_classes = len(dataset.classes)
@@ -450,7 +452,8 @@ def main(data_dir, output_dir=None, n_splits=5, batch_size=32, num_epochs=50, le
     
     # Load dataset
     print(f"Loading dataset from {data_dir}...")
-    dataset = CustomImageDataset(root_dir=data_dir, transform=data_transforms)
+    # dataset = CustomImageDataset(root_dir=data_dir, transform=data_transforms)
+    dataset = datasets.ImageFolder(root=data_dir)
     print(f"Dataset loaded with {len(dataset)} samples and {len(dataset.classes)} classes")
     
     # Check device
