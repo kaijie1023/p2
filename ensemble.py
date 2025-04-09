@@ -5,7 +5,7 @@ import timm
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler,  Subset
 from torchvision import datasets, transforms
 from torchvision.models import resnet18, densenet121, ResNet18_Weights, DenseNet121_Weights
 from sklearn.model_selection import StratifiedKFold
@@ -16,6 +16,22 @@ import random
 import time
 from typing import List, Dict, Tuple, Any, Optional
 import copy
+
+train_transforms = transforms.Compose([
+    transforms.RandomResizedCrop(224),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+val_transforms = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
 
 # Set seed for reproducibility
 def set_seed(seed: int = 42) -> None:
@@ -217,7 +233,7 @@ class LRScheduler:
 
 # Stratified Cross-Validation
 def stratified_cross_validation(
-    dataset: Dataset,
+    data_dir: str,
     model_class: Any,
     n_splits: int = 5,
     batch_size: int = 32,
@@ -247,6 +263,11 @@ def stratified_cross_validation(
     # Initialize StratifiedKFold
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     
+    # Load dataset
+    print(f"Loading dataset from {data_dir}...")
+    dataset = CustomImageDataset(root_dir=data_dir)
+    print(f"Dataset loaded with {len(dataset)} samples and {len(dataset.classes)} classes")
+
     # Get targets
     targets = dataset.targets
     
@@ -268,13 +289,40 @@ def stratified_cross_validation(
 
         # Create train and validation datasets with appropriate transforms
         train_dataset = datasets.ImageFolder(
-            root=dataset_path,
+            root=data_dir,
             transform=train_transforms
         )
         
         val_dataset = datasets.ImageFolder(
-            root=dataset_path, 
+            root=data_dir, 
             transform=val_transforms
+        )
+
+        # Use indices to create subsets
+        train_subset = Subset(train_dataset, train_idx)
+        val_subset = Subset(val_dataset, val_idx)
+        test_subset = Subset(val_dataset, test_index)
+        
+        # Create data loaders
+        train_loader = DataLoader(
+            train_subset, 
+            batch_size=batch_size, 
+            shuffle=True,
+            num_workers=4
+        )
+        
+        val_loader = DataLoader(
+            val_subset, 
+            batch_size=batch_size, 
+            shuffle=False,
+            num_workers=4
+        )
+
+        test_loader = DataLoader(
+            test_subset, 
+            batch_size=batch_size, 
+            shuffle=False,
+            num_workers=4
         )
         
         # Initialize model
@@ -450,19 +498,13 @@ def main(data_dir, output_dir=None, n_splits=5, batch_size=32, num_epochs=50, le
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    # Load dataset
-    print(f"Loading dataset from {data_dir}...")
-    # dataset = CustomImageDataset(root_dir=data_dir, transform=data_transforms)
-    dataset = datasets.ImageFolder(root=data_dir)
-    print(f"Dataset loaded with {len(dataset)} samples and {len(dataset.classes)} classes")
-    
     # Check device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
     # Run stratified cross-validation
     results = stratified_cross_validation(
-        dataset=dataset,
+        data_dir=data_dir,
         model_class=EnsembleModel,
         n_splits=n_splits,
         batch_size=batch_size,
