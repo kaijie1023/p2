@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler,  Subset
+from torchmetrics.classification import MulticlassAUROC
 from torchvision import datasets, transforms
 from torchvision.models import resnet18, densenet121, ResNet18_Weights, DenseNet121_Weights
 from sklearn.model_selection import StratifiedKFold
@@ -401,6 +402,9 @@ def stratified_cross_validation(
         model.eval()
         y_true = []
         y_pred = []
+
+        roc_auc_metric = MulticlassAUROC(num_classes=num_classes).to(device)
+        roc_auc_metric.reset()
         
         with torch.no_grad():
             for inputs, labels in test_loader:
@@ -410,21 +414,26 @@ def stratified_cross_validation(
                 
                 y_true.extend(labels.cpu().numpy())
                 y_pred.extend(preds.cpu().numpy())
+
+                probs = torch.softmax(outputs, dim=1)
+                roc_auc_metric.update(probs.cpu(), labels.cpu())
         
         # Calculate metrics
         accuracy = accuracy_score(y_true, y_pred)
         precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
         recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
         f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+        roc_auc = roc_auc_metric.compute().item()
         
         fold_metrics = {
             'accuracy': accuracy,
             'precision': precision,
             'recall': recall,
-            'f1': f1
+            'f1': f1,
+            'roc_auc': roc_auc
         }
         
-        print(f"Test Metrics - Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+        print(f"Test Metrics - Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}, ROC: {roc_auc:.4f}")
         
         # Store results
         results['fold_metrics'].append(fold_metrics)
