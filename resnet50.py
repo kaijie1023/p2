@@ -4,11 +4,12 @@ import pandas as pd
 import timm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler,  Subset
 from torchmetrics.classification import MulticlassAUROC
 from torchvision import datasets, transforms
-from torchvision.models import resnet50, densenet121, ResNet50_Weights, DenseNet121_Weights
+from torchvision.models import resnet50, ResNet50_Weights
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 import matplotlib.pyplot as plt
@@ -114,7 +115,7 @@ class CustomImageDataset(Dataset):
 
 # Ensemble Model
 class EnsembleModel(nn.Module):
-    """Ensemble of ResNet, DenseNet, and DeiT models with weighted voting."""
+    """Ensemble of ResNet, resnet, and DeiT models with weighted voting."""
     
     def __init__(self, num_classes: int, pretrained: bool = True):
         """
@@ -137,9 +138,12 @@ class EnsembleModel(nn.Module):
     def get_model_outputs(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Get individual model outputs for analysis."""
         res_out = self.resnet(x)
-        dense_out = self.densenet(x)
+        dense_out = self.resnet(x)
         deit_out = self.deit(x)
         return res_out, dense_out, deit_out
+    
+    def name(self) -> str:
+        return "resnet"
 
 # Training utilities
 class EarlyStopping:
@@ -289,21 +293,21 @@ def stratified_cross_validation(
             train_subset, 
             batch_size=batch_size, 
             shuffle=True,
-            num_workers=4
+            num_workers=2
         )
         
         val_loader = DataLoader(
             val_subset, 
             batch_size=batch_size, 
             shuffle=False,
-            num_workers=4
+            num_workers=2
         )
 
         test_loader = DataLoader(
             test_subset, 
             batch_size=batch_size, 
             shuffle=False,
-            num_workers=4
+            num_workers=2
         )
         
         # Initialize model
@@ -475,6 +479,144 @@ def plot_losses(train_losses, val_losses, fold=None):
     plt.grid(True)
     return plt
 
+
+class GradCAM_CNN:
+    def __init__(self, model, target_layer):
+        self.model = model.eval()
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+
+        def forward_hook(module, input, output):
+            self.activations = output
+            # print("activations:", self.activations.shape)  # Expect [1, C, H, W] (e.g., 1x512x7x7)
+
+        def backward_hook(module, grad_in, grad_out):
+            self.gradients = grad_out[0]
+            # print("gradients:", self.gradients.shape)
+
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_backward_hook(backward_hook)
+
+    def generate(self, x, class_idx=None):
+        output = self.model(x)
+        if class_idx is None:
+            class_idx = output.argmax().item()
+        loss = output[:, class_idx]
+        self.model.zero_grad()
+        loss.backward()
+
+        weights = self.gradients.mean(dim=(2, 3), keepdim=True)
+
+        # Invert weights if needed (for ResNet)
+        if type(self.model).__name__ == 'ResNet':
+            weights = -weights
+
+        cam = (weights * self.activations).sum(dim=1, keepdim=True)
+        cam = F.relu(cam)
+        cam = F.interpolate(cam, size=x.shape[2:], mode='bilinear', align_corners=False)
+        cam = cam.squeeze().detach().cpu().numpy()
+        cam = (cam - cam.min()) / (cam.max() + 1e-8)
+        return cam
+    
+class GradCAM_MultiLayer:
+    def __init__(self, model, target_layers):
+        self.model = model.eval()
+        self.target_layers = target_layers  # List of layers
+        self.activations = {}
+        self.gradients = {}
+
+        # Register hooks for each layer
+        for i, layer in enumerate(self.target_layers):
+            layer.register_forward_hook(self._make_forward_hook(i))
+            layer.register_backward_hook(self._make_backward_hook(i))
+
+    def _make_forward_hook(self, name):
+        def forward_hook(module, input, output):
+            self.activations[name] = output
+        return forward_hook
+
+    def _make_backward_hook(self, name):
+        def backward_hook(module, grad_input, grad_output):
+            self.gradients[name] = grad_output[0]
+        return backward_hook
+
+    def generate(self, x, class_idx=None, combine_method='average'):
+        self.model.zero_grad()
+        output = self.model(x)
+        if class_idx is None:
+            class_idx = output.argmax().item()
+        loss = output[:, class_idx]
+        loss.backward()
+
+        cams = []
+
+        for i in self.activations.keys():
+            act = self.activations[i]
+            grad = self.gradients[i]
+
+            weights = grad.mean(dim=(2, 3), keepdim=True)
+            cam = (weights * act).sum(dim=1, keepdim=True)
+            cam = F.relu(cam)
+            cam = F.interpolate(cam, size=x.shape[2:], mode='bilinear', align_corners=False)
+            cam = cam.squeeze()
+            cam = cam - cam.min()
+            cam = cam / (cam.max() + 1e-8)
+            cams.append(cam.detach().cpu().numpy())
+
+        if combine_method == 'average':
+            final_cam = sum(cams) / len(cams)
+            return final_cam
+        else:
+            return cams  # return all individual CAMs
+
+class GradCAM_DeiT:             
+    def __init__(self, model, target_block):
+        self.model = model.eval()
+        self.target_block = target_block
+        self.attn_output = None
+        self.gradients = None
+
+        def forward_hook(module, input, output):
+            self.attn_output = output
+
+        def backward_hook(module, grad_in, grad_out):
+            self.gradients = grad_out[0]
+
+        self.target_block.register_forward_hook(forward_hook)
+        self.target_block.register_backward_hook(backward_hook)
+
+    def generate(self, x, class_idx=None):
+        output = self.model(x)
+        if class_idx is None:
+            class_idx = output.argmax().item()
+        loss = output[:, class_idx]
+        self.model.zero_grad()
+        loss.backward()
+
+        grads = self.gradients.mean(dim=1)
+        cam = (self.attn_output * grads.unsqueeze(-1)).sum(dim=2)
+        cam = cam[:, 1:]  # Skip [CLS] 
+        cam = cam.reshape(1, 14, 14).detach().cpu().numpy()
+        cam = (cam - cam.min()) / (cam.max() + 1e-8)
+        return cam.squeeze()
+
+def save_cam_on_image(img_tensor, cam, save_path, title=None):
+    import os
+
+    img = img_tensor.squeeze().permute(1, 2, 0).detach().cpu().numpy()
+    img = (img - img.min()) / (img.max() - img.min())
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+    heatmap = np.float32(heatmap) / 255
+    overlay = 0.5 * heatmap + 0.5 * img
+    overlay = np.uint8(255 * overlay)
+
+    # Save with OpenCV
+    cv2.imwrite(save_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+
+    if title:
+        print(f"Saved: {title} -> {save_path}")
+
 def preprocess_image(image_path: str, image_size: int = 224) -> torch.Tensor:
     """
     Loads and preprocesses an image for CNN/ViT models.
@@ -514,10 +656,63 @@ def main(data_dir, output_dir=None, n_splits=5, batch_size=32, num_epochs=50, le
     # Plot losses for each fold
     if output_dir:
 
+        # GradCAM
+        cams_resnet = []
+        cams_deit = []
+        cams_combined = []
+
         for fold in range(n_splits):
             plt_fig = plot_losses(results['train_losses'][fold], results['val_losses'][fold], fold)
             plt_fig.savefig(os.path.join(output_dir, f'fold_{fold+1}_losses.png'))
             plt.close()
+
+            # GradCAM
+            # Load trained model for this fold
+            ensemble_model = results['models'][fold]
+            ensemble_model.eval()
+
+            # Extract submodels
+            resnet = ensemble_model.resnet
+            # deit = ensemble_model.deit
+
+            # Prepare target layers
+            target_layer = resnet.layer4[-1].conv3
+            # target_layer = resnet.layer4[1].conv2
+            # target_layer_deit = deit.blocks[-1].attn
+            # target_layers = [
+            #     resnet.layer2[-1].conv3,
+            #     resnet.layer3[-1].conv3,
+            #     resnet.layer4[-1].conv3
+            # ]
+
+            # Build GradCAM handlers
+            cam_dense = GradCAM_CNN(resnet, target_layer)
+            # cam_deit = GradCAM_DeiT(deit, target_layer_deit)
+            # cam_dense = GradCAM_MultiLayer(resnet, target_layers)
+
+            # 4. Load and preprocess input image
+            image_tensor = preprocess_image(f"{data_dir}/Monkeypox/monkeypox1.png").to(device)
+            # image_tensor = preprocess_image(f"{data_dir}/Monkeypox/monkeypox262.png").to(device)
+
+            # Generate CAMs for image
+            cam_d = cam_dense.generate(image_tensor)
+            # cam_v = cam_deit.generate(image_tensor)
+
+            # Resize ViT CAM to match CNN CAM
+            # cam_v_resized = cv2.resize(cam_v, cam_d.shape[::-1])
+
+            # Average this fold’s submodel CAMs (optional)
+            # cam_fold_avg = (cam_d) / 1
+
+            # Store for ensemble averaging later
+            cams_resnet.append(cam_d)
+            # cams_deit.append(cam_v_resized)
+            cams_combined.append(cam_d)
+
+            # Save intermediate fold CAMs
+            save_cam_on_image(image_tensor.cpu(), cam_d, f"{output_dir}/cam_resnet_fold{fold}.jpg", title=f"resnet Fold {fold}")
+            # save_cam_on_image(image_tensor.cpu(), cam_v_resized, f"{output_dir}/cam_deit_fold{fold}.jpg", title=f"DeiT Fold {fold}")
+            # save_cam_on_image(image_tensor.cpu(), cam_fold_avg, f"{output_dir}/cam_ensemble_fold{fold}.jpg", title=f"Ensemble Fold {fold}")
         
         # Save average metrics
         metrics_df = pd.DataFrame([results['avg_metrics']])
@@ -528,15 +723,19 @@ def main(data_dir, output_dir=None, n_splits=5, batch_size=32, num_epochs=50, le
         fold_metrics_df.to_csv(os.path.join(output_dir, 'fold_metrics.csv'), index=False)
 
 
-        plt.figure(figsize=(6, 6))
-        plt.imshow(results['lime_mask'], cmap='hot')
-        plt.title("Aggregated LIME Mask Across K-Folds (Post-Training)")
-        plt.axis('off')
-        plt.colorbar()
+        # plt.figure(figsize=(6, 6))
+        # plt.imshow(results['lime_mask'], cmap='hot')
+        # plt.title("Aggregated LIME Mask Across K-Folds (Post-Training)")
+        # plt.axis('off')
+        # plt.colorbar()
 
-        plt.tight_layout()
-        plt.savefig(f"{output_dir}/aggregated_lime_heatmap.jpg", dpi=300, bbox_inches='tight')
-        plt.close()
+        # plt.tight_layout()
+        # plt.savefig(f"{output_dir}/aggregated_lime_heatmap.jpg", dpi=300, bbox_inches='tight')
+        # plt.close()
+
+        # Ensemble GradCAM across folds
+        final_cam = np.mean(np.stack(cams_combined), axis=0)
+        save_cam_on_image(image_tensor.cpu(), final_cam, f"{output_dir}/cam_ensemble_kfold.jpg", title="K-Fold Ensemble CAM")
 
     
     return results
