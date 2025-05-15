@@ -1,17 +1,18 @@
 import os
 import numpy as np
 import pandas as pd
+import seaborn as sns
 import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler,  Subset
-from torchmetrics.classification import MulticlassAUROC
+from torchmetrics.classification import MulticlassAccuracy, MulticlassPrecision, MulticlassRecall, MulticlassF1Score, MulticlassAUROC, MulticlassConfusionMatrix
 from torchvision import datasets, transforms
 from torchvision.models import resnet50, ResNet50_Weights
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_curve, auc, confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 from PIL import Image
 import random
@@ -19,7 +20,24 @@ import time
 from typing import List, Dict, Tuple, Any, Optional
 import copy
 import cv2
-from lime import lime_image
+
+from pytorch_grad_cam import GradCAMPlusPlus
+from pytorch_grad_cam.utils.image import show_cam_on_image
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+
+# Check device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+gradcam_images = [
+    '/Monkeypox/monkeypox1.png',
+    '/Monkeypox/monkeypox32.png',
+    '/Monkeypox/monkeypox59.png',
+    '/Monkeypox/monkeypox100.png'
+    '/Monkeypox/monkeypox183.png',
+    '/Monkeypox/monkeypox252.png',
+    '/Monkeypox/monkeypox271.png'
+]
 
 train_transforms = transforms.Compose([
     transforms.RandomResizedCrop(224),
@@ -49,69 +67,63 @@ def set_seed(seed: int = 42) -> None:
 
 set_seed()
 
-# Custom Dataset
-class CustomImageDataset(Dataset):
+# Function to load dataset from directory
+def load_dataset_from_directory(data_dir):
     """
-    Custom dataset that loads images from a directory structure.
-    
-    Expected directory structure:
-    root_dir/
-        class_1/
+    Load images from a directory structure:
+    data_dir/
+        class1/
             img1.jpg
             img2.jpg
             ...
-        class_2/
+        class2/
             img1.jpg
             ...
         ...
-    """
     
-    def __init__(self, root_dir: str, transform=None):
-        """
-        Args:
-            root_dir (str): Directory with all the images organized in class folders
-            transform (callable, optional): Optional transform to be applied on a sample
-        """
-        self.root_dir = root_dir
-        self.transform = transform
-        self.classes = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
-        self.class_to_idx = {cls_name: i for i, cls_name in enumerate(self.classes)}
-        
-        self.samples = []
-        self.targets = []
-        
-        # Build dataset
-        for class_name in self.classes:
-            class_dir = os.path.join(root_dir, class_name)
-            class_idx = self.class_to_idx[class_name]
-            
+    Returns:
+        image_paths: List of paths to images
+        labels: Corresponding labels (numeric)
+        class_names: List of class names
+    """
+    image_paths = []
+    labels = []
+    class_names = sorted(os.listdir(data_dir))
+    class_to_idx = {class_name: i for i, class_name in enumerate(class_names)}
+    
+    for class_name in class_names:
+        class_dir = os.path.join(data_dir, class_name)
+        if os.path.isdir(class_dir):
             for img_name in os.listdir(class_dir):
                 if img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
                     img_path = os.path.join(class_dir, img_name)
-                    self.samples.append(img_path)
-                    self.targets.append(class_idx)
-        
-        self.targets = np.array(self.targets)
+                    image_paths.append(img_path)
+                    labels.append(class_to_idx[class_name])
     
-    def __len__(self) -> int:
-        return len(self.samples)
-    
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        img_path = self.samples[idx]
-        target = self.targets[idx]
+    return image_paths, labels, class_names
+
+# Custom Dataset class for loading images from a directory
+class ImageDataset(Dataset):
+    def __init__(self, image_paths, labels, transform=None):
+        self.image_paths = image_paths
+        self.labels = labels
+        self.transform = transform
         
-        # Load image
-        try:
-            image = Image.open(img_path).convert('RGB')
-        except Exception as e:
-            print(f"Error loading image {img_path}: {e}")
-            # Return a blank image if there's an error
-            image = Image.new('RGB', (224, 224), color='black')
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert('RGB')
+        # image = np.array(Image.open(img_path).convert('RGB'))
+        label = self.labels[idx]
         
         if self.transform:
             image = self.transform(image)
-        
-        return image, target
+            # augmented = self.transform(image=image)
+            # image = augmented['image']  # get the transformed tensor
+            
+        return image, label
 
 # Ensemble Model
 class EnsembleModel(nn.Module):
@@ -245,73 +257,54 @@ def stratified_cross_validation(
     Returns:
         Dictionary with performance metrics and trained models
     """
-    # Initialize StratifiedKFold
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    
     # Load dataset
-    print(f"Loading dataset from {data_dir}...")
-    dataset = CustomImageDataset(root_dir=data_dir)
-    print(f"Dataset loaded with {len(dataset)} samples and {len(dataset.classes)} classes")
+    image_paths, labels, class_names = load_dataset_from_directory(data_dir)
+    num_classes = len(class_names)
 
-    # Get targets
-    targets = dataset.targets
+    # First, split into test and train+val with stratification
+    X_train_val, X_test, y_train_val, y_test = train_test_split(
+        image_paths, labels, test_size=0.2, stratify=labels, random_state=42
+    )
+
+    # Create test dataset and loader
+    test_dataset = ImageDataset(X_test, y_test, transform=val_transforms)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    # Initialize k-fold cross validation
+    kfold = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     
     # Results storage
     results = {
         'fold_metrics': [],
         'models': [],
-        'test_indices': [],
         'train_losses': [],
-        'val_losses': []
+        'val_losses': [],
+        'cams': {}
     }
+
+
+    # GradCAM images key map to image id
+    for i in gradcam_images:
+        results['cams'][get_image_id(i)] = []
     
     # Loop through folds
-    for fold, (train_index, test_index) in enumerate(skf.split(np.zeros(len(targets)), targets)):
+    for fold, (train_idx, val_idx) in enumerate(kfold.split(X_train_val, y_train_val)):
         print(f"\n{'='*50}\nFold {fold+1}/{n_splits}\n{'='*50}")
 
-        # Split train into train and validation
-        train_idx, val_idx = train_test_split(train_index, test_size=0.125, stratify=targets)
-
-        # Create train and validation datasets with appropriate transforms
-        train_dataset = datasets.ImageFolder(
-            root=data_dir,
-            transform=train_transforms
-        )
+         # Get fold training and validation data
+        X_train = [X_train_val[i] for i in train_idx]
+        y_train = [y_train_val[i] for i in train_idx]
+        X_val = [X_train_val[i] for i in val_idx]
+        y_val = [y_train_val[i] for i in val_idx]
         
-        val_dataset = datasets.ImageFolder(
-            root=data_dir, 
-            transform=val_transforms
-        )
-
-        # Use indices to create subsets
-        train_subset = Subset(train_dataset, train_idx)
-        val_subset = Subset(val_dataset, val_idx)
-        test_subset = Subset(val_dataset, test_index)
+        # Create datasets and dataloaders for this fold
+        train_dataset = ImageDataset(X_train, y_train, transform=train_transforms)
+        val_dataset = ImageDataset(X_val, y_val, transform=val_transforms)
         
-        # Create data loaders
-        train_loader = DataLoader(
-            train_subset, 
-            batch_size=batch_size, 
-            shuffle=True,
-            num_workers=2
-        )
-        
-        val_loader = DataLoader(
-            val_subset, 
-            batch_size=batch_size, 
-            shuffle=False,
-            num_workers=2
-        )
-
-        test_loader = DataLoader(
-            test_subset, 
-            batch_size=batch_size, 
-            shuffle=False,
-            num_workers=2
-        )
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
         
         # Initialize model
-        num_classes = len(dataset.classes)
         model = model_class(num_classes=num_classes).to(device)
         
         # Loss function and optimizer
@@ -386,82 +379,105 @@ def stratified_cross_validation(
         model.eval()
         y_true = []
         y_pred = []
-
-        roc_auc_metric = MulticlassAUROC(num_classes=num_classes).to(device)
-        roc_auc_metric.reset()
         
         with torch.no_grad():
+            preds = []
             for inputs, labels in test_loader:
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
-                _, preds = torch.max(outputs, 1)
+                # _, preds = torch.max(outputs, 1)
                 
-                y_true.extend(labels.cpu().numpy())
-                y_pred.extend(preds.cpu().numpy())
+                y_true.extend(labels)
+                preds.append(torch.softmax(outputs, dim=1))
 
-                probs = torch.softmax(outputs, dim=1)
-                roc_auc_metric.update(probs.cpu(), labels.cpu())
+                # probs = torch.softmax(outputs, dim=1)
+                # roc_auc_metric.update(probs.cpu(), labels.cpu())
+            y_pred.append(torch.cat(preds))
+        
+        target_layer = model.resnet.layer4[-1].conv3
+        cam = GradCAMPlusPlus(model=model.resnet, target_layers=[target_layer])
+        # gradcam = GradCAM_CNN(model.resnet, target_layer)
+
+
+        for i in gradcam_images:
+            image_tensor = preprocess_image(f"{data_dir}/Monkeypox/monkeypox1.png").to(device)
+
+            # Run forward pass through the model
+            output = model(image_tensor)
+
+            # Get predicted class index (highest probability)
+            pred_class = output.argmax(dim=1).item() 
+
+            # Use the predicted class for Grad-CAM++
+            targets = [ClassifierOutputTarget(pred_class)]
+
+            # Generate heatmap
+            grayscale_cam = cam(input_tensor=image_tensor, targets=targets)
+
+            results['cams'][get_image_id(i)].append(grayscale_cam[0])
         
         
-        # Calculate metrics
-        accuracy = accuracy_score(y_true, y_pred)
-        precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-        recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-        f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
-        roc_auc = roc_auc_metric.compute().item()
+
+        # results['cams'].append(grayscale_cam[0])
         
-        fold_metrics = {
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'roc_auc': roc_auc
-        }
-        
-        print(f"Test Metrics - Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}, ROC: {roc_auc:.4f}")
         
         # Store results
-        results['fold_metrics'].append(fold_metrics)
+        # results['fold_metrics'].append(fold_metrics)
         results['models'].append(model)
-        results['test_indices'].append(test_index)
         results['train_losses'].append(train_losses)
         results['val_losses'].append(val_losses)
     
     # Calculate overall metrics
-    avg_metrics = {metric: np.mean([fold[metric] for fold in results['fold_metrics']]) 
-                 for metric in results['fold_metrics'][0].keys()}
+    # avg_metrics = {metric: np.mean([fold[metric] for fold in results['fold_metrics']]) 
+                #  for metric in results['fold_metrics'][0].keys()}
     
-    results['avg_metrics'] = avg_metrics
+    # results['avg_metrics'] = avg_metrics
     
     print("\nAverage Metrics Across All Folds:")
-    for metric, value in avg_metrics.items():
-        print(f"{metric}: {value:.4f}")
+    # for metric, value in avg_metrics.items():
+    #     print(f"{metric}: {value:.4f}")
+
+    # Average predictions across models
+    avg_preds = torch.stack(y_pred).mean(dim=0)
+    final_preds = torch.argmax(avg_preds, dim=1)
+    final_labels = torch.tensor(y_true).to(device)
+
+    accuracy = MulticlassAccuracy(num_classes=num_classes).to(device)
+    accuracy.update(final_preds, final_labels)
+    accuracy = accuracy.compute().item()
+
+    precision = MulticlassPrecision(num_classes=num_classes).to(device)
+    precision.update(final_preds, final_labels)
+    precision = precision.compute().item()
+
+    recall = MulticlassRecall(num_classes=num_classes).to(device)
+    recall.update(final_preds, final_labels)
+    recall = recall.compute().item()
+
+    f1 = MulticlassF1Score(num_classes=num_classes).to(device)
+    f1.update(final_preds, final_labels)
+    f1 = f1.compute().item()
+
+    roc_auc = MulticlassAUROC(num_classes=num_classes).to(device)
+    roc_auc.update(avg_preds, final_labels)
+    roc_auc = roc_auc.compute().item()
+
+    cm = MulticlassConfusionMatrix(num_classes=num_classes).to(device)
+    cm.update(final_preds, final_labels)
+    cm = cm.compute()
+
+    results['metrics'] = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'roc_auc': roc_auc,
+        'confusion_matrix': cm
+    }
+
+    print(f"Test Metrics - Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}, ROC AUC: {roc_auc:.4f}")
     
     return results
-
-# Utility for splitting train indices into train and validation
-def train_test_split(indices, test_size=0.2, stratify=None):
-    """Split indices into training and test sets."""
-    if stratify is None:
-        # Random split
-        test_size = int(len(indices) * test_size)
-        np.random.shuffle(indices)
-        return indices[test_size:], indices[:test_size]
-    else:
-        # Stratified split
-        unique_classes = np.unique(stratify)
-        train_indices = []
-        val_indices = []
-
-        for cls in unique_classes:
-            cls_indices = indices[stratify[indices] == cls]
-            n_val = int(len(cls_indices) * test_size)
-            
-            np.random.shuffle(cls_indices)
-            val_indices.extend(cls_indices[:n_val])
-            train_indices.extend(cls_indices[n_val:])
-
-        return np.array(train_indices), np.array(val_indices)
 
 # Plot training and validation loss
 def plot_losses(train_losses, val_losses, fold=None):
@@ -479,127 +495,76 @@ def plot_losses(train_losses, val_losses, fold=None):
     plt.grid(True)
     return plt
 
+# Evaluate the model
+def evaluate_model(model, test_loader, class_names, output_dir, save=False):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_probs = []
 
-class GradCAM_CNN:
-    def __init__(self, model, target_layer):
-        self.model = model.eval()
-        self.target_layer = target_layer
-        self.gradients = None
-        self.activations = None
-
-        def forward_hook(module, input, output):
-            self.activations = output
-            # print("activations:", self.activations.shape)  # Expect [1, C, H, W] (e.g., 1x512x7x7)
-
-        def backward_hook(module, grad_in, grad_out):
-            self.gradients = grad_out[0]
-            # print("gradients:", self.gradients.shape)
-
-        self.target_layer.register_forward_hook(forward_hook)
-        self.target_layer.register_backward_hook(backward_hook)
-
-    def generate(self, x, class_idx=None):
-        output = self.model(x)
-        if class_idx is None:
-            class_idx = output.argmax().item()
-        loss = output[:, class_idx]
-        self.model.zero_grad()
-        loss.backward()
-
-        weights = self.gradients.mean(dim=(2, 3), keepdim=True)
-
-        # Invert weights if needed (for ResNet)
-        if type(self.model).__name__ == 'ResNet':
-            weights = -weights
-
-        cam = (weights * self.activations).sum(dim=1, keepdim=True)
-        cam = F.relu(cam)
-        cam = F.interpolate(cam, size=x.shape[2:], mode='bilinear', align_corners=False)
-        cam = cam.squeeze().detach().cpu().numpy()
-        cam = (cam - cam.min()) / (cam.max() + 1e-8)
-        return cam
+    roc_auc_metric = MulticlassAUROC(num_classes=len(class_names)).to(device)
+    roc_auc_metric.reset()
+    cm_metric = MulticlassConfusionMatrix(num_classes=len(class_names)).to(device)
+    cm_metric.reset()
     
-class GradCAM_MultiLayer:
-    def __init__(self, model, target_layers):
-        self.model = model.eval()
-        self.target_layers = target_layers  # List of layers
-        self.activations = {}
-        self.gradients = {}
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            
+            outputs = model(inputs)
+            probs = torch.nn.functional.softmax(outputs, dim=1)
+            _, preds = torch.max(outputs, 1)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
 
-        # Register hooks for each layer
-        for i, layer in enumerate(self.target_layers):
-            layer.register_forward_hook(self._make_forward_hook(i))
-            layer.register_backward_hook(self._make_backward_hook(i))
-
-    def _make_forward_hook(self, name):
-        def forward_hook(module, input, output):
-            self.activations[name] = output
-        return forward_hook
-
-    def _make_backward_hook(self, name):
-        def backward_hook(module, grad_input, grad_output):
-            self.gradients[name] = grad_output[0]
-        return backward_hook
-
-    def generate(self, x, class_idx=None, combine_method='average'):
-        self.model.zero_grad()
-        output = self.model(x)
-        if class_idx is None:
-            class_idx = output.argmax().item()
-        loss = output[:, class_idx]
-        loss.backward()
-
-        cams = []
-
-        for i in self.activations.keys():
-            act = self.activations[i]
-            grad = self.gradients[i]
-
-            weights = grad.mean(dim=(2, 3), keepdim=True)
-            cam = (weights * act).sum(dim=1, keepdim=True)
-            cam = F.relu(cam)
-            cam = F.interpolate(cam, size=x.shape[2:], mode='bilinear', align_corners=False)
-            cam = cam.squeeze()
-            cam = cam - cam.min()
-            cam = cam / (cam.max() + 1e-8)
-            cams.append(cam.detach().cpu().numpy())
-
-        if combine_method == 'average':
-            final_cam = sum(cams) / len(cams)
-            return final_cam
-        else:
-            return cams  # return all individual CAMs
-
-class GradCAM_DeiT:             
-    def __init__(self, model, target_block):
-        self.model = model.eval()
-        self.target_block = target_block
-        self.attn_output = None
-        self.gradients = None
-
-        def forward_hook(module, input, output):
-            self.attn_output = output
-
-        def backward_hook(module, grad_in, grad_out):
-            self.gradients = grad_out[0]
-
-        self.target_block.register_forward_hook(forward_hook)
-        self.target_block.register_backward_hook(backward_hook)
-
-    def generate(self, x, class_idx=None):
-        output = self.model(x)
-        if class_idx is None:
-            class_idx = output.argmax().item()
-        loss = output[:, class_idx]
-        self.model.zero_grad()
-        loss.backward()
-
-        grads = self.gradients.mean(dim=1)
-        cam = (self.attn_output * grads.unsqueeze(-1)).sum(dim=2)
-        cam = cam[:, 1:]  # Skip [CLS] 
-        cam = cam.reshape(1, 14, 14).detach().cpu().numpy()
-        cam = (cam - cam.min()) / (cam.max() + 1e-8)
-        return cam.squeeze()
+            probs = torch.softmax(outputs, dim=1)
+            roc_auc_metric.update(probs.cpu(), labels.cpu())
+            cm_metric.update(torch.tensor(preds), torch.tensor(labels))
+    
+    # Convert to numpy arrays
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    all_probs = np.array(all_probs)
+    
+    # Calculate metrics
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision = precision_score(all_labels, all_preds, average='weighted')
+    recall = recall_score(all_labels, all_preds, average='weighted')
+    f1 = f1_score(all_labels, all_preds, average='weighted')
+    roc_auc = roc_auc_metric.compute().item()
+    cm = cm_metric.compute()
+    
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print(f"ROC AUC: {roc_auc:.4f}")
+    
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm_metric, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.tight_layout()
+    # plt.show()
+    if (save):
+        plt.savefig(f"{output_dir}/confusion_matrix.png")
+        plt.close()
+    
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'roc': roc_auc,
+        'confusion_matrix': cm,
+        'predictions': all_preds,
+        'true_labels': all_labels,
+        'probabilities': all_probs
+    }
 
 def save_cam_on_image(img_tensor, cam, save_path, title=None):
     import os
@@ -616,6 +581,13 @@ def save_cam_on_image(img_tensor, cam, save_path, title=None):
 
     if title:
         print(f"Saved: {title} -> {save_path}")
+
+def get_image_id(path):
+    return path.split('/')[-1].split('.')[0]
+
+def normalize_gradcam_iamge(image_path: str):
+    image = Image.open(image_path).convert("RGB")
+    return np.array(image.resize((224, 224))) / 255.0
 
 def preprocess_image(image_path: str, image_size: int = 224) -> torch.Tensor:
     """
@@ -638,10 +610,6 @@ def main(data_dir, output_dir=None, n_splits=5, batch_size=32, num_epochs=50, le
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
-    # Check device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
     # Run stratified cross-validation
     results = stratified_cross_validation(
         data_dir=data_dir,
@@ -656,86 +624,46 @@ def main(data_dir, output_dir=None, n_splits=5, batch_size=32, num_epochs=50, le
     # Plot losses for each fold
     if output_dir:
 
-        # GradCAM
-        cams_resnet = []
-        cams_deit = []
-        cams_combined = []
-
         for fold in range(n_splits):
             plt_fig = plot_losses(results['train_losses'][fold], results['val_losses'][fold], fold)
             plt_fig.savefig(os.path.join(output_dir, f'fold_{fold+1}_losses.png'))
             plt.close()
 
-            # GradCAM
-            # Load trained model for this fold
-            ensemble_model = results['models'][fold]
-            ensemble_model.eval()
-
-            # Extract submodels
-            resnet = ensemble_model.resnet
-            # deit = ensemble_model.deit
-
-            # Prepare target layers
-            target_layer = resnet.layer4[-1].conv3
-            # target_layer = resnet.layer4[1].conv2
-            # target_layer_deit = deit.blocks[-1].attn
-            # target_layers = [
-            #     resnet.layer2[-1].conv3,
-            #     resnet.layer3[-1].conv3,
-            #     resnet.layer4[-1].conv3
-            # ]
-
-            # Build GradCAM handlers
-            cam_dense = GradCAM_CNN(resnet, target_layer)
-            # cam_deit = GradCAM_DeiT(deit, target_layer_deit)
-            # cam_dense = GradCAM_MultiLayer(resnet, target_layers)
-
-            # 4. Load and preprocess input image
-            image_tensor = preprocess_image(f"{data_dir}/Monkeypox/monkeypox1.png").to(device)
-            # image_tensor = preprocess_image(f"{data_dir}/Monkeypox/monkeypox262.png").to(device)
-
-            # Generate CAMs for image
-            cam_d = cam_dense.generate(image_tensor)
-            # cam_v = cam_deit.generate(image_tensor)
-
-            # Resize ViT CAM to match CNN CAM
-            # cam_v_resized = cv2.resize(cam_v, cam_d.shape[::-1])
-
-            # Average this fold’s submodel CAMs (optional)
-            # cam_fold_avg = (cam_d) / 1
-
-            # Store for ensemble averaging later
-            cams_resnet.append(cam_d)
-            # cams_deit.append(cam_v_resized)
-            cams_combined.append(cam_d)
-
-            # Save intermediate fold CAMs
-            save_cam_on_image(image_tensor.cpu(), cam_d, f"{output_dir}/cam_resnet_fold{fold}.jpg", title=f"resnet Fold {fold}")
-            # save_cam_on_image(image_tensor.cpu(), cam_v_resized, f"{output_dir}/cam_deit_fold{fold}.jpg", title=f"DeiT Fold {fold}")
-            # save_cam_on_image(image_tensor.cpu(), cam_fold_avg, f"{output_dir}/cam_ensemble_fold{fold}.jpg", title=f"Ensemble Fold {fold}")
-        
         # Save average metrics
-        metrics_df = pd.DataFrame([results['avg_metrics']])
-        metrics_df.to_csv(os.path.join(output_dir, 'avg_metrics.csv'), index=False)
+        metrics_df = pd.DataFrame([results['metrics']], columns=['accuracy', 'precision', 'recall', 'f1', 'roc_auc'])
+        metrics_df.to_csv(os.path.join(output_dir, 'metrics.csv'), index=False)
         
         # Save individual fold metrics
-        fold_metrics_df = pd.DataFrame(results['fold_metrics'])
-        fold_metrics_df.to_csv(os.path.join(output_dir, 'fold_metrics.csv'), index=False)
+        # fold_metrics_df = pd.DataFrame(results['fold_metrics'])
+        # fold_metrics_df.to_csv(os.path.join(output_dir, 'fold_metrics.csv'), index=False)
+        
+        for img in results['cams']:
+            avg_cam = np.mean(results['cams'][img], axis=0)
+
+            # save_cam_on_image(preprocess_image(f"{data_dir}/Monkeypox/monkeypox1.png"), cam, f"{output_dir}/cam.png")
+
+            # Visualize the average
+            visualization = show_cam_on_image(normalize_gradcam_iamge(f"{data_dir}/Monkeypox/{img}.png"), avg_cam, use_rgb=True)
+
+            # Save the visualization
+            save_path = f"{output_dir}/gradcam_{img}.png"
+            cv2.imwrite(save_path, cv2.cvtColor(visualization, cv2.COLOR_RGB2BGR))
 
 
-        # plt.figure(figsize=(6, 6))
-        # plt.imshow(results['lime_mask'], cmap='hot')
-        # plt.title("Aggregated LIME Mask Across K-Folds (Post-Training)")
-        # plt.axis('off')
-        # plt.colorbar()
+        # # Average Grad-CAM across folds
+        # avg_cam = np.mean(results['cams'], axis=0)
 
-        # plt.tight_layout()
-        # plt.savefig(f"{output_dir}/aggregated_lime_heatmap.jpg", dpi=300, bbox_inches='tight')
-        # plt.close()
+        # # Load and normalize image
+        # # bgr_image = cv2.imread(f"{data_dir}/Monkeypox/monkeypox1.png")
+        # # rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+        # # rgb_image_float = rgb_image.astype(np.float32) / 255.0
 
-        # Ensemble GradCAM across folds
-        final_cam = np.mean(np.stack(cams_combined), axis=0)
-        save_cam_on_image(image_tensor.cpu(), final_cam, f"{output_dir}/cam_ensemble_kfold.jpg", title="K-Fold Ensemble CAM")
+        # # Visualize the average
+        # visualization = show_cam_on_image(normalize_gradcam_iamge(f"{data_dir}/Monkeypox/monkeypox1.png"), avg_cam, use_rgb=True)
+
+        # # Save the visualization
+        # save_path = f"{output_dir}/gradcam_image.png"
+        # cv2.imwrite(save_path, cv2.cvtColor(visualization, cv2.COLOR_RGB2BGR))
 
     
     return results
