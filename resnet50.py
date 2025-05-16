@@ -399,8 +399,8 @@ def stratified_cross_validation(
         # gradcam = GradCAM_CNN(model.resnet, target_layer)
 
 
-        for i in gradcam_images:
-            image_tensor = preprocess_image(f"{data_dir}/Monkeypox/monkeypox1.png").to(device)
+        for image in gradcam_images:
+            image_tensor = preprocess_image(f"{data_dir}{image}").to(device)
 
             # Run forward pass through the model
             output = model(image_tensor)
@@ -414,7 +414,7 @@ def stratified_cross_validation(
             # Generate heatmap
             grayscale_cam = cam(input_tensor=image_tensor, targets=targets)
 
-            results['cams'][get_image_id(i)].append(grayscale_cam[0])
+            results['cams'][get_image_id(image)].append(grayscale_cam[0])
         
         
 
