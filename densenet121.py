@@ -533,7 +533,7 @@ def main(data_dir, output_dir=None, n_splits=5, batch_size=32, num_epochs=50, le
         plt.tight_layout()
 
         # Save the figure
-        plt.savefig("confusion_matrix.png", dpi=300)
+        plt.savefig(f"{output_dir}/confusion_matrix.png", dpi=300)
         plt.close()
     
     return results
