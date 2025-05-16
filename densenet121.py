@@ -133,7 +133,7 @@ class EnsembleModel(nn.Module):
         
         # Initialize models
         self.densenet = densenet121(weights=DenseNet121_Weights.DEFAULT)
-        self.densenet.fc = nn.Linear(self.densenet.fc.in_features, num_classes)
+        self.densenet.classifier = nn.Linear(self.densenet.classifier.in_features, num_classes)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with weighted ensemble."""
@@ -525,7 +525,7 @@ def main(data_dir, output_dir=None, n_splits=5, batch_size=32, num_epochs=50, le
 
         # Visualization of confusion matrix
         plt.figure(figsize=(6, 5))
-        sns.heatmap(results['metrics']['confusion_matrix'], annot=True, fmt="d", cmap="Blues", xticklabels=[f"Pred {i}" for i in range(3)],
+        sns.heatmap(results['metrics']['confusion_matrix'].cpu(), annot=True, fmt="d", cmap="Blues", xticklabels=[f"Pred {i}" for i in range(3)],
                     yticklabels=[f"True {i}" for i in range(3)])
         plt.xlabel("Predicted")
         plt.ylabel("Actual")
