@@ -9,7 +9,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchmetrics.classification import MulticlassAccuracy, MulticlassPrecision, MulticlassRecall, MulticlassF1Score, MulticlassAUROC, MulticlassConfusionMatrix
 from torchvision import datasets, transforms
-from torchvision.models import densenet121, DenseNet121_Weights
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from sklearn.model_selection import StratifiedKFold, train_test_split
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -132,16 +132,16 @@ class EnsembleModel(nn.Module):
         super(EnsembleModel, self).__init__()
         
         # Initialize models
-        self.densenet = densenet121(weights=DenseNet121_Weights.DEFAULT)
-        self.densenet.classifier = nn.Linear(self.densenet.classifier.in_features, num_classes)
+        self.efficientnet = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
+        self.efficientnet.classifier[1] = nn.Linear(self.efficientnet.classifier[1].in_features, num_classes)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with weighted ensemble."""
-        out = self.densenet(x)
+        out = self.efficientnet(x)
         return out
     
     def name(self) -> str:
-        return "densenet"
+        return "efficientnet"
 
 # Training utilities
 class EarlyStopping:
@@ -376,8 +376,8 @@ def stratified_cross_validation(
 
             y_pred.append(torch.cat(preds))
         
-        target_layer = model.densenet.features[-1]
-        cam = GradCAMPlusPlus(model=model.densenet, target_layers=[target_layer])
+        target_layer = model.efficientnet.features[-1]
+        cam = GradCAMPlusPlus(model=model.efficientnet, target_layers=[target_layer])
 
 
         for image in gradcam_images:
@@ -551,7 +551,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Run stratified cross-validation for ensemble deep learning')
     parser.add_argument('--data_dir', type=str, default='./MSID3', required=False, help='Path to dataset directory')
-    parser.add_argument('--output_dir', type=str, default='./output_densenet', help='Output directory for results')
+    parser.add_argument('--output_dir', type=str, default='./output_efficientnet', help='Output directory for results')
     parser.add_argument('--n_splits', type=int, default=5, help='Number of folds for cross-validation')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--num_epochs', type=int, default=50, help='Maximum number of training epochs')

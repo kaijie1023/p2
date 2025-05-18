@@ -2,21 +2,18 @@ import os
 import numpy as np
 import pandas as pd
 import seaborn as sns
-import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler,  Subset
+from torch.utils.data import Dataset, DataLoader
 from torchmetrics.classification import MulticlassAccuracy, MulticlassPrecision, MulticlassRecall, MulticlassF1Score, MulticlassAUROC, MulticlassConfusionMatrix
 from torchvision import datasets, transforms
 from torchvision.models import resnet50, ResNet50_Weights
 from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_curve, auc, confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 from PIL import Image
 import random
-import time
 from typing import List, Dict, Tuple, Any, Optional
 import copy
 import cv2
@@ -33,7 +30,7 @@ gradcam_images = [
     '/Monkeypox/monkeypox1.png',
     '/Monkeypox/monkeypox32.png',
     '/Monkeypox/monkeypox59.png',
-    '/Monkeypox/monkeypox100.png'
+    '/Monkeypox/monkeypox100.png',
     '/Monkeypox/monkeypox183.png',
     '/Monkeypox/monkeypox252.png',
     '/Monkeypox/monkeypox271.png'
@@ -115,13 +112,10 @@ class ImageDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         image = Image.open(img_path).convert('RGB')
-        # image = np.array(Image.open(img_path).convert('RGB'))
         label = self.labels[idx]
         
         if self.transform:
             image = self.transform(image)
-            # augmented = self.transform(image=image)
-            # image = augmented['image']  # get the transformed tensor
             
         return image, label
 
@@ -143,16 +137,8 @@ class EnsembleModel(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with weighted ensemble."""
-        res_out = self.resnet(x)
-        
-        return res_out
-    
-    def get_model_outputs(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get individual model outputs for analysis."""
-        res_out = self.resnet(x)
-        dense_out = self.resnet(x)
-        deit_out = self.deit(x)
-        return res_out, dense_out, deit_out
+        out = self.resnet(x)
+        return out
     
     def name(self) -> str:
         return "resnet"
@@ -282,7 +268,6 @@ def stratified_cross_validation(
         'cams': {}
     }
 
-
     # GradCAM images key map to image id
     for i in gradcam_images:
         results['cams'][get_image_id(i)] = []
@@ -385,18 +370,14 @@ def stratified_cross_validation(
             for inputs, labels in test_loader:
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
-                # _, preds = torch.max(outputs, 1)
-                
+
                 y_true.extend(labels)
                 preds.append(torch.softmax(outputs, dim=1))
 
-                # probs = torch.softmax(outputs, dim=1)
-                # roc_auc_metric.update(probs.cpu(), labels.cpu())
             y_pred.append(torch.cat(preds))
         
         target_layer = model.resnet.layer4[-1].conv3
         cam = GradCAMPlusPlus(model=model.resnet, target_layers=[target_layer])
-        # gradcam = GradCAM_CNN(model.resnet, target_layer)
 
 
         for image in gradcam_images:
@@ -416,27 +397,63 @@ def stratified_cross_validation(
 
             results['cams'][get_image_id(image)].append(grayscale_cam[0])
         
-        
-
-        # results['cams'].append(grayscale_cam[0])
-        
-        
         # Store results
-        # results['fold_metrics'].append(fold_metrics)
         results['models'].append(model)
         results['train_losses'].append(train_losses)
         results['val_losses'].append(val_losses)
     
-    # Calculate overall metrics
-    # avg_metrics = {metric: np.mean([fold[metric] for fold in results['fold_metrics']]) 
-                #  for metric in results['fold_metrics'][0].keys()}
-    
-    # results['avg_metrics'] = avg_metrics
-    
     print("\nAverage Metrics Across All Folds:")
-    # for metric, value in avg_metrics.items():
-    #     print(f"{metric}: {value:.4f}")
 
+    metrics = get_metrics(y_true=y_true, y_pred=y_pred, num_classes=num_classes)
+
+    results['metrics'] = metrics
+
+    print(f"Test Metrics - Accuracy: {metrics['accuracy']:.4f}, Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f}, F1: {metrics['f1']:.4f}, ROC AUC: {metrics['roc_auc']:.4f}")
+    
+    return results
+
+# Plot training and validation loss
+def plot_losses(train_losses, val_losses, fold=None):
+    """Plot training and validation losses."""
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    title = 'Training and Validation Loss'
+    if fold is not None:
+        title += f' - Fold {fold+1}'
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    return plt
+
+def get_image_id(path):
+    return path.split('/')[-1].split('.')[0]
+
+def normalize_gradcam_iamge(image_path: str):
+    image = Image.open(image_path).convert("RGB")
+    return np.array(image.resize((224, 224))) / 255.0
+
+def preprocess_image(image_path: str, image_size: int = 224) -> torch.Tensor:
+    """
+    Loads and preprocesses an image for CNN/ViT models.
+
+    Args:
+        image_path (str): Path to the input image.
+        image_size (int): Target image size (default is 224).
+
+    Returns:
+        torch.Tensor: Preprocessed image tensor of shape [1, 3, H, W].
+    """
+    image = Image.open(image_path).convert("RGB")
+    tensor = val_transforms(image).unsqueeze(0)  # Add batch dimension
+    return tensor
+
+def get_metrics(y_true, y_pred, num_classes):
+    """
+    Calculate various metrics for model evaluation.
+    """
     # Average predictions across models
     avg_preds = torch.stack(y_pred).mean(dim=0)
     final_preds = torch.argmax(avg_preds, dim=1)
@@ -466,7 +483,7 @@ def stratified_cross_validation(
     cm.update(final_preds, final_labels)
     cm = cm.compute()
 
-    results['metrics'] = {
+    return {
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
@@ -474,135 +491,6 @@ def stratified_cross_validation(
         'roc_auc': roc_auc,
         'confusion_matrix': cm
     }
-
-    print(f"Test Metrics - Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}, ROC AUC: {roc_auc:.4f}")
-    
-    return results
-
-# Plot training and validation loss
-def plot_losses(train_losses, val_losses, fold=None):
-    """Plot training and validation losses."""
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    title = 'Training and Validation Loss'
-    if fold is not None:
-        title += f' - Fold {fold+1}'
-    plt.title(title)
-    plt.legend()
-    plt.grid(True)
-    return plt
-
-# Evaluate the model
-def evaluate_model(model, test_loader, class_names, output_dir, save=False):
-    model.eval()
-    all_preds = []
-    all_labels = []
-    all_probs = []
-
-    roc_auc_metric = MulticlassAUROC(num_classes=len(class_names)).to(device)
-    roc_auc_metric.reset()
-    cm_metric = MulticlassConfusionMatrix(num_classes=len(class_names)).to(device)
-    cm_metric.reset()
-    
-    with torch.no_grad():
-        for inputs, labels in test_loader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            
-            outputs = model(inputs)
-            probs = torch.nn.functional.softmax(outputs, dim=1)
-            _, preds = torch.max(outputs, 1)
-            
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
-
-            probs = torch.softmax(outputs, dim=1)
-            roc_auc_metric.update(probs.cpu(), labels.cpu())
-            cm_metric.update(torch.tensor(preds), torch.tensor(labels))
-    
-    # Convert to numpy arrays
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    all_probs = np.array(all_probs)
-    
-    # Calculate metrics
-    accuracy = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds, average='weighted')
-    recall = recall_score(all_labels, all_preds, average='weighted')
-    f1 = f1_score(all_labels, all_preds, average='weighted')
-    roc_auc = roc_auc_metric.compute().item()
-    cm = cm_metric.compute()
-    
-    print(f"Accuracy: {accuracy:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"F1 Score: {f1:.4f}")
-    print(f"ROC AUC: {roc_auc:.4f}")
-    
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm_metric, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.title('Confusion Matrix')
-    plt.tight_layout()
-    # plt.show()
-    if (save):
-        plt.savefig(f"{output_dir}/confusion_matrix.png")
-        plt.close()
-    
-    return {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'roc': roc_auc,
-        'confusion_matrix': cm,
-        'predictions': all_preds,
-        'true_labels': all_labels,
-        'probabilities': all_probs
-    }
-
-def save_cam_on_image(img_tensor, cam, save_path, title=None):
-    import os
-
-    img = img_tensor.squeeze().permute(1, 2, 0).detach().cpu().numpy()
-    img = (img - img.min()) / (img.max() - img.min())
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
-    heatmap = np.float32(heatmap) / 255
-    overlay = 0.5 * heatmap + 0.5 * img
-    overlay = np.uint8(255 * overlay)
-
-    # Save with OpenCV
-    cv2.imwrite(save_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-
-    if title:
-        print(f"Saved: {title} -> {save_path}")
-
-def get_image_id(path):
-    return path.split('/')[-1].split('.')[0]
-
-def normalize_gradcam_iamge(image_path: str):
-    image = Image.open(image_path).convert("RGB")
-    return np.array(image.resize((224, 224))) / 255.0
-
-def preprocess_image(image_path: str, image_size: int = 224) -> torch.Tensor:
-    """
-    Loads and preprocesses an image for CNN/ViT models.
-
-    Args:
-        image_path (str): Path to the input image.
-        image_size (int): Target image size (default is 224).
-
-    Returns:
-        torch.Tensor: Preprocessed image tensor of shape [1, 3, H, W].
-    """
-    image = Image.open(image_path).convert("RGB")
-    tensor = val_transforms(image).unsqueeze(0)  # Add batch dimension
-    return tensor
 
 # Main training workflow
 def main(data_dir, output_dir=None, n_splits=5, batch_size=32, num_epochs=50, learning_rate=5e-5):
@@ -633,14 +521,8 @@ def main(data_dir, output_dir=None, n_splits=5, batch_size=32, num_epochs=50, le
         metrics_df = pd.DataFrame([results['metrics']], columns=['accuracy', 'precision', 'recall', 'f1', 'roc_auc'])
         metrics_df.to_csv(os.path.join(output_dir, 'metrics.csv'), index=False)
         
-        # Save individual fold metrics
-        # fold_metrics_df = pd.DataFrame(results['fold_metrics'])
-        # fold_metrics_df.to_csv(os.path.join(output_dir, 'fold_metrics.csv'), index=False)
-        
         for img in results['cams']:
             avg_cam = np.mean(results['cams'][img], axis=0)
-
-            # save_cam_on_image(preprocess_image(f"{data_dir}/Monkeypox/monkeypox1.png"), cam, f"{output_dir}/cam.png")
 
             # Visualize the average
             visualization = show_cam_on_image(normalize_gradcam_iamge(f"{data_dir}/Monkeypox/{img}.png"), avg_cam, use_rgb=True)
@@ -649,22 +531,18 @@ def main(data_dir, output_dir=None, n_splits=5, batch_size=32, num_epochs=50, le
             save_path = f"{output_dir}/gradcam_{img}.png"
             cv2.imwrite(save_path, cv2.cvtColor(visualization, cv2.COLOR_RGB2BGR))
 
+        # Visualization of confusion matrix
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(results['metrics']['confusion_matrix'].cpu(), annot=True, fmt="d", cmap="Blues", xticklabels=[f"Pred {i}" for i in range(3)],
+                    yticklabels=[f"True {i}" for i in range(3)])
+        plt.xlabel("Predicted")
+        plt.ylabel("Actual")
+        plt.title("Multiclass Confusion Matrix")
+        plt.tight_layout()
 
-        # # Average Grad-CAM across folds
-        # avg_cam = np.mean(results['cams'], axis=0)
-
-        # # Load and normalize image
-        # # bgr_image = cv2.imread(f"{data_dir}/Monkeypox/monkeypox1.png")
-        # # rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-        # # rgb_image_float = rgb_image.astype(np.float32) / 255.0
-
-        # # Visualize the average
-        # visualization = show_cam_on_image(normalize_gradcam_iamge(f"{data_dir}/Monkeypox/monkeypox1.png"), avg_cam, use_rgb=True)
-
-        # # Save the visualization
-        # save_path = f"{output_dir}/gradcam_image.png"
-        # cv2.imwrite(save_path, cv2.cvtColor(visualization, cv2.COLOR_RGB2BGR))
-
+        # Save the figure
+        plt.savefig(f"{output_dir}/confusion_matrix.png", dpi=300)
+        plt.close()
     
     return results
 
