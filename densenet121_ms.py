@@ -681,7 +681,7 @@ def main(data_dir, output_dir=None, n_splits=5, batch_size=32, num_epochs=50, le
     )
 
     # Create train dataset and loader
-    train_dataset = ImageDataset(X_train, y_train, transform=val_transforms)
+    train_dataset = ImageDataset(X_train, y_train, transform=train_transforms)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     # Create val dataset and loader
