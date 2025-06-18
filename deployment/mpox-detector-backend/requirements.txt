@@ -1,0 +1,4 @@
+fastapi
+torchvision
+PIL
+torch
