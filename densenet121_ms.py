@@ -381,6 +381,10 @@ def stratified_cross_validation(
     # GradCAM images key map to image id
     for i in gradcam_images:
         results['cams'][get_image_id(i)] = []
+
+    # Prepare data for k-fold
+    y_true = []
+    y_pred = []
     
     # Loop through folds
     for fold, (train_idx, val_idx) in enumerate(kfold.split(X_train_val, y_train_val)):
@@ -472,22 +476,22 @@ def stratified_cross_validation(
         
         # Evaluate on test set
         model.eval()
-        y_true = []
-        y_pred = []
         
         with torch.no_grad():
+            true_labels = []
             preds = []
             for inputs, labels in test_loader:
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
 
                 y_true.extend(labels)
+                true_labels.append(labels)
                 preds.append(torch.softmax(outputs, dim=1))
 
-            y_pred.append(torch.cat(preds))
+            y_pred.extend(torch.cat(preds))
 
             acc = MulticlassAccuracy(num_classes=num_classes).to(device)
-            acc.update(torch.cat(y_pred).argmax(dim=1), torch.tensor(y_true).to(device))
+            acc.update(torch.cat(preds).argmax(dim=1), torch.cat(true_labels))
             acc = acc.compute().item()
             print(f"Val Accuracy: {acc:.4f}")
             if results['best_model'] is None:
@@ -578,9 +582,8 @@ def get_metrics(y_true, y_pred, num_classes):
     """
     Calculate various metrics for model evaluation.
     """
-    # Average predictions across models
-    avg_preds = torch.stack(y_pred).mean(dim=0)
-    final_preds = torch.argmax(avg_preds, dim=1)
+    stack_preds = torch.stack(y_pred)
+    final_preds = torch.argmax(stack_preds, dim=1)
     final_labels = torch.tensor(y_true).to(device)
 
     accuracy = MulticlassAccuracy(num_classes=num_classes).to(device)
@@ -600,7 +603,7 @@ def get_metrics(y_true, y_pred, num_classes):
     f1 = f1.compute().item()
 
     roc_auc = MulticlassAUROC(num_classes=num_classes).to(device)
-    roc_auc.update(avg_preds, final_labels)
+    roc_auc.update(stack_preds, final_labels)
     roc_auc = roc_auc.compute().item()
 
     cm = MulticlassConfusionMatrix(num_classes=num_classes).to(device)
