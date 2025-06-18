@@ -8,3 +8,6 @@ cifar-10_data*
 MSID
 MSID3
 split_data
+
+output*/*
+*checkpoint*
