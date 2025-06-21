@@ -2,3 +2,4 @@ fastapi
 torchvision
 Pillow
 torch
+seaborn
