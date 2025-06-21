@@ -6,4 +6,4 @@ seaborn
 torchmetrics
 scikit-learn
 opencv-python
-pytorch_grad_cam
+grad-cam
