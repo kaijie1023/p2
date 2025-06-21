@@ -1,4 +1,4 @@
 fastapi
 torchvision
-PIL
+Pillow
 torch
