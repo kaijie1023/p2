@@ -7,3 +7,4 @@ torchmetrics
 scikit-learn
 opencv-python
 grad-cam
+streamlit
